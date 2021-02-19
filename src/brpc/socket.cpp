@@ -1,20 +1,20 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Copyright (c) 2014 Baidu, Inc.
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
+//          Rujie Jiang (jiangrujie@baidu.com)
+//          Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #include "butil/compat.h"                        // OS_MACOSX
 #include <openssl/ssl.h>
@@ -728,12 +728,6 @@ int Socket::WaitAndReset(int32_t expected_nref) {
             _pipeline_q->clear();
         }
     }
-
-    SharedPart* sp = GetSharedPart();
-    if (sp) {
-        sp->circuit_breaker.Reset();
-        sp->recent_error_count.store(0, butil::memory_order_relaxed);
-    }
     return 0;
 }
 
@@ -756,6 +750,11 @@ void Socket::Revive() {
                 vref, MakeVRef(id_ver, nref + 1/*note*/),
                 butil::memory_order_release,
                 butil::memory_order_relaxed)) {
+            SharedPart* sp = GetSharedPart();
+            if (sp) {
+                sp->circuit_breaker.Reset();
+                sp->recent_error_count.store(0, butil::memory_order_relaxed);
+            }
             // Set this flag to true since we add additional ref again
             _recycle_flag.store(false, butil::memory_order_relaxed);
             if (_user) {

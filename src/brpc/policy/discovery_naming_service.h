@@ -1,20 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2018 BiliBili, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Jiashun Zhu(zhujiashun@bilibili.com)
 
 #ifndef BRPC_POLICY_DISCOVERY_NAMING_SERVICE_H
 #define BRPC_POLICY_DISCOVERY_NAMING_SERVICE_H
@@ -40,31 +38,44 @@ struct DiscoveryRegisterParam {
     bool IsValid() const;
 };
 
+struct DiscoveryFetchsParam {
+    std::string appid;
+    std::string env;
+    std::string status;
+
+    bool IsValid() const;
+};
+
 // ONE DiscoveryClient corresponds to ONE service instance.
 // If your program has multiple service instances to register,
 // you need multiple DiscoveryClient.
-// Note: Cancel to the server is automatically called in dtor.
+// Note: Unregister is automatically called in dtor.
 class DiscoveryClient {
 public:
     DiscoveryClient();
     ~DiscoveryClient();
 
-    // Initialize this client.
-    // Returns 0 on success.
-    // NOTE: Calling more than once does nothing and returns 0.
     int Register(const DiscoveryRegisterParam& req);
+    int Fetchs(const DiscoveryFetchsParam& req, std::vector<ServerNode>* servers) const;
 
 private:
     static void* PeriodicRenew(void* arg);
     int DoCancel() const;
-    int DoRegister();
+    int DoRegister() const;
     int DoRenew() const;
 
 private:
     bthread_t _th;
     butil::atomic<bool> _registered;
-    DiscoveryRegisterParam _params;
-    butil::EndPoint _current_discovery_server;
+    std::string _appid;
+    std::string _hostname;
+    std::string _addrs;
+    std::string _env;
+    std::string _region;
+    std::string _zone;
+    int _status;
+    std::string _version;
+    std::string _metadata;
 };
 
 class DiscoveryNamingService : public PeriodicNamingService {

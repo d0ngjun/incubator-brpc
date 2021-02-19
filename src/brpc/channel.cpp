@@ -1,20 +1,20 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2014 Baidu, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
+//          Rujie Jiang(jiangrujie@baidu.com)
+//          Zhangyi Chen(chenzhangyi01@baidu.com)
 
 #include <inttypes.h>
 #include <google/protobuf/descriptor.h>
@@ -33,6 +33,7 @@
 #include "brpc/channel.h"
 #include "brpc/details/usercode_backup_pool.h"       // TooManyUserCode
 #include "brpc/policy/esp_authenticator.h"
+#include "brpc/boss_guard.h" // BossGuard
 
 namespace brpc {
 
@@ -102,7 +103,7 @@ static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
         }
         butil::MurmurHash3_x64_128_Update(&mm_ctx, buf.data(), buf.size());
         buf.clear();
-    
+
         if (opt.has_ssl_options()) {
             const CertInfo& cert = opt.ssl_options().client_cert;
             if (!cert.certificate.empty()) {
@@ -158,7 +159,7 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
         // Save has_error which will be overriden in later assignments to
         // connection_type.
         const bool has_error = _options.connection_type.has_error();
-        
+
         if (protocol->supported_connection_type & CONNECTION_TYPE_SINGLE) {
             _options.connection_type = CONNECTION_TYPE_SINGLE;
         } else if (protocol->supported_connection_type & CONNECTION_TYPE_POOLED) {
@@ -335,7 +336,7 @@ int Channel::Init(const char* ns_url,
     LoadBalancerWithNaming* lb = new (std::nothrow) LoadBalancerWithNaming;
     if (NULL == lb) {
         LOG(FATAL) << "Fail to new LoadBalancerWithNaming";
-        return -1;        
+        return -1;
     }
     GetNamingServiceThreadOptions ns_opt;
     ns_opt.succeed_without_server = _options.succeed_without_server;
@@ -350,6 +351,16 @@ int Channel::Init(const char* ns_url,
         return -1;
     }
     _lb.reset(lb);
+
+    const char* p1 = ns_url;
+    while (*p1 != ':') {
+        if (p1 < ns_url + 10 && *p1) {
+            ++p1;
+        }
+    }
+    if (*p1 == ':' && *++p1 == '/' && *++p1 == '/') {
+        _ns_url.assign(p1+1);
+    }
     return 0;
 }
 
@@ -388,6 +399,8 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     }
     cntl->_preferred_index = _preferred_index;
     cntl->_retry_policy = _options.retry_policy;
+    BossGuard boss_guard(cntl, this, request, start_send_real_us);
+    cntl->set_boss_guard(boss_guard);
     if (_options.enable_circuit_breaker) {
         cntl->add_flag(Controller::FLAGS_ENABLED_CIRCUIT_BREAKER);
     }
@@ -464,20 +477,20 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     // Share the lb with controller.
     cntl->_lb = _lb;
 
-    // Ensure that serialize_request is done before pack_request in all
-    // possible executions, including:
-    //   HandleSendFailed => OnVersionedRPCReturned => IssueRPC(pack_request)
-    _serialize_request(&cntl->_request_buf, cntl, request);
-    if (cntl->FailedInline()) {
-        // Handle failures caused by serialize_request, and these error_codes
-        // should be excluded from the retry_policy.
-        return cntl->HandleSendFailed();
-    }
     if (FLAGS_usercode_in_pthread &&
         done != NULL &&
         TooManyUserCode()) {
         cntl->SetFailed(ELIMIT, "Too many user code to run when "
                         "-usercode_in_pthread is on");
+        return cntl->HandleSendFailed();
+    }
+    if (cntl->FailedInline()) {
+        // probably failed before RPC, not called until all necessary
+        // parameters in `cntl' are set.
+        return cntl->HandleSendFailed();
+    }
+    _serialize_request(&cntl->_request_buf, cntl, request);
+    if (cntl->FailedInline()) {
         return cntl->HandleSendFailed();
     }
 

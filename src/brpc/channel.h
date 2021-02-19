@@ -1,20 +1,19 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2014 Baidu, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
+//          Rujie Jiang (jiangrujie@baidu.com)
 
 #ifndef BRPC_CHANNEL_H
 #define BRPC_CHANNEL_H
@@ -47,7 +46,7 @@ struct ChannelOptions {
     // Default: 200 (milliseconds)
     // Maximum: 0x7fffffff (roughly 30 days)
     int32_t connect_timeout_ms;
-    
+
     // Max duration of RPC over this Channel. -1 means wait indefinitely.
     // Overridable by Controller.set_timeout_ms().
     // Default: 500 (milliseconds)
@@ -69,9 +68,9 @@ struct ChannelOptions {
     // Default: 3
     // Maximum: INT_MAX
     int max_retry;
-    
-    // When the error rate of a server node is too high, isolate the node. 
-    // Note that this isolation is GLOBAL, the node will become unavailable 
+
+    // When the error rate of a server node is too high, isolate the node.
+    // Note that this isolation is GLOBAL, the node will become unavailable
     // for all channels running in this process during the isolation.
     // Default: false
     bool enable_circuit_breaker;
@@ -88,7 +87,7 @@ struct ChannelOptions {
     // Possible values: "single", "pooled", "short".
     AdaptiveConnectionType connection_type;
 
-    // Channel.Init() succeeds even if there's no server in the NamingService. 
+    // Channel.Init() succeeds even if there's no server in the NamingService.
     // E.g. the BNS directory is empty. All RPC over the channel will fail before
     // new nodes being added to the NamingService.
     // Default: true (false before r32470)
@@ -147,6 +146,7 @@ private:
 class Channel : public ChannelBase {
 friend class Controller;
 friend class SelectiveChannel;
+friend class BossGuard;
 public:
     Channel(ProfilerLinker = ProfilerLinker());
     ~Channel();
@@ -159,7 +159,7 @@ public:
 
     // Connect this channel to a group of servers whose addresses can be
     // accessed via `naming_service_url' according to its protocol. Use the
-    // method specified by `load_balancer_name' to distribute traffic to 
+    // method specified by `load_balancer_name' to distribute traffic to
     // servers. Use default options if `options' is NULL.
     // Supported naming service("protocol://service_name"):
     //   bns://<node-name>            # Baidu Naming Service
@@ -174,11 +174,11 @@ public:
     //   "" or NULL                   # treat `naming_service_url' as `server_addr_and_port'
     //                                # Init(xxx, "", options) and Init(xxx, NULL, options)
     //                                # are exactly same with Init(xxx, options)
-    int Init(const char* naming_service_url, 
+    int Init(const char* naming_service_url,
              const char* load_balancer_name,
              const ChannelOptions* options);
 
-    // Call `method' of the remote service with `request' as input, and 
+    // Call `method' of the remote service with `request' as input, and
     // `response' as output. `controller' contains options and extra data.
     // If `done' is not NULL, this method returns after request was sent
     // and `done->Run()' will be called when the call finishes, otherwise
@@ -202,7 +202,7 @@ protected:
 
     bool SingleServer() const { return _lb.get() == NULL; }
 
-    // Pick a server using `lb' and then send RPC. Wait for response when 
+    // Pick a server using `lb' and then send RPC. Wait for response when
     // sending synchronous RPC.
     // NOTE: DO NOT directly use `controller' after this call when
     // sending asynchronous RPC (controller->_done != NULL) since
@@ -215,6 +215,7 @@ protected:
                    const char* raw_server_address,
                    const ChannelOptions* options);
 
+    std::string _ns_url;
     butil::EndPoint _server_address;
     SocketId _server_id;
     Protocol::SerializeRequest _serialize_request;

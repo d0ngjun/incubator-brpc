@@ -1,20 +1,19 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2014 Baidu, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
+//          Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>             // MethodDescriptor
 #include <gflags/gflags.h>
@@ -40,6 +39,8 @@
 #include "brpc/policy/http2_rpc_protocol.h"
 #include "brpc/details/usercode_backup_pool.h"
 #include "brpc/grpc.h"
+#include "brpc/boss_guard.h"
+#include "butil/color_log_header.h"
 
 extern "C" {
 void bthread_assign_data(void* data);
@@ -131,6 +132,7 @@ CommonStrings::CommonStrings()
     , H2_METHOD(":method")
     , METHOD_GET("GET")
     , METHOD_POST("POST")
+    , TRACE_ID("Trace-Id")
     , TE("te")
     , TRAILERS("trailers")
     , GRPC_ENCODING("grpc-encoding")
@@ -273,8 +275,19 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         return;
     }
 
-    ControllerPrivateAccessor accessor(cntl);
+    logging::ColorLogHeader* log_header = nullptr;
+    if (!logging::ColorLogHeader::bls_color_log_header()) {
+        log_header = logging::CreateColorLogHeader();
+    } else {
+        log_header = logging::ColorLogHeader::bls_color_log_header();
+    }
+    if (log_header) {
+        log_header->InitFromeHttpHeader(cntl->http_request());
+    }
+    
+    logging::ColorLogHeader::set_bls_color_log_header(log_header);
 
+    ControllerPrivateAccessor accessor(cntl);
     Span* span = accessor.span();
     if (span) {
         span->set_base_real_us(msg->base_real_us());
@@ -295,7 +308,7 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         ParseContentType(res_header->content_type(), &is_grpc_ct);
     const bool is_grpc = (is_http2 && is_grpc_ct);
     bool grpc_compressed = false;  // only valid when is_grpc is true.
-    
+
     do {
         if (!is_http2) {
             // If header has "Connection: close", close the connection.
@@ -361,7 +374,7 @@ void ProcessHttpResponse(InputMessageBase* msg) {
             }
             break;
         }
-        
+
         // Fail RPC if status code is an error in http sense.
         // ErrorCode of RPC is unified to EHTTP.
         const int sc = res_header->status_code();
@@ -511,7 +524,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
             opt.bytes_to_base64 = cntl->has_pb_bytes_to_base64();
             opt.jsonify_empty_array = cntl->has_pb_jsonify_empty_array();
             opt.always_print_primitive_fields = cntl->has_always_print_primitive_fields();
-            
+
             opt.enum_option = (FLAGS_pb_enum_as_number
                                ? json2pb::OUTPUT_ENUM_BY_NUMBER
                                : json2pb::OUTPUT_ENUM_BY_NAME);
@@ -583,7 +596,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
             hreq.SetHeader(common->TE, common->TRAILERS);
             if (cntl->timeout_ms() >= 0) {
                 hreq.SetHeader(common->GRPC_TIMEOUT,
-                        butil::string_printf("%" PRId64 "m", cntl->timeout_ms()));
+                        butil::string_printf("%ldm", cntl->timeout_ms()));
             }
             // Append compressed and length before body
             AddGrpcPrefix(&cntl->request_attachment(), grpc_compressed);
@@ -613,6 +626,14 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
                            "%llu", (unsigned long long)span->span_id()));
         hreq.SetHeader("x-bd-parent-span-id", butil::string_printf(
                            "%llu", (unsigned long long)span->parent_span_id()));
+    }
+
+    if (logging::ColorLogHeader::bls_color_log_header()) {
+        logging::ColorLogHeader* p = logging::ColorLogHeader::bls_color_log_header();
+        HttpHeader header = *p;
+        for (auto it = header.HeaderBegin(); it != header.HeaderEnd(); ++it) {
+            hreq.SetHeader(it->first, it->second);
+        }
     }
 }
 
@@ -698,15 +719,17 @@ HttpResponseSender::~HttpResponseSender() {
     if (cntl == NULL) {
         return;
     }
+    BossHostGuard boss_host_guard(cntl);
     ControllerPrivateAccessor accessor(cntl);
     Span* span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
     ConcurrencyRemover concurrency_remover(_method_status, cntl, _received_us);
+    cntl->set_end_rpc_time_us(butil::gettimeofday_us());
     Socket* socket = accessor.get_sending_socket();
     const google::protobuf::Message* res = _res.get();
-    
+
     if (cntl->IsCloseConnection()) {
         socket->SetFailed();
         return;
@@ -741,7 +764,7 @@ HttpResponseSender::~HttpResponseSender() {
         // ^ a pb service
         !cntl->Failed()) {
         // ^ pb response in failed RPC is undefined, no need to convert.
-        
+
         butil::IOBufAsZeroCopyOutputStream wrapper(&cntl->response_attachment());
         if (content_type == HTTP_CONTENT_PROTO) {
             if (!res->SerializeToZeroCopyStream(&wrapper)) {
@@ -797,7 +820,7 @@ HttpResponseSender::~HttpResponseSender() {
         // status code is always 200 according to grpc protocol
         res_header->set_status_code(HTTP_STATUS_OK);
     }
-    
+
     bool grpc_compressed = false;
     if (cntl->Failed()) {
         cntl->response_attachment().clear();
@@ -948,7 +971,7 @@ FindMethodPropertyByURIImpl(const std::string& uri_path, const Server* server,
     butil::StringPiece service_name(splitter.field(), splitter.length());
     const bool full_service_name =
         (service_name.find('.') != butil::StringPiece::npos);
-    const Server::ServiceProperty* const sp = 
+    const Server::ServiceProperty* const sp =
         (full_service_name ?
          wrapper.FindServicePropertyByFullName(service_name) :
          wrapper.FindServicePropertyByName(service_name));
@@ -986,7 +1009,7 @@ FindMethodPropertyByURIImpl(const std::string& uri_path, const Server* server,
             return mp;
         }
     }
-    
+
     // Try [service_name]/default_method
     mp = wrapper.FindMethodPropertyByFullName(service_name, common->DEFAULT_METHOD);
     if (mp) {
@@ -1031,7 +1054,7 @@ FindMethodPropertyByURI(const std::string& uri_path, const Server* server,
 
 ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
                              bool read_eof, const void* /*arg*/) {
-    HttpContext* http_imsg = 
+    HttpContext* http_imsg =
         static_cast<HttpContext*>(socket->parsing_context());
     if (http_imsg == NULL) {
         if (read_eof || source->empty()) {
@@ -1099,7 +1122,7 @@ ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
             }
             return result;
         } else if (socket->is_read_progressive() &&
-                   http_imsg->stage() >= HTTP_ON_HEADERS_COMPLETE) {
+                   http_imsg->stage() >= HTTP_ON_HEADERS_COMPLELE) {
             // header part of a progressively-read http message is complete,
             // go on to ProcessHttpXXX w/o waiting for full body.
             http_imsg->AddOneRefForStage2(); // released when body is fully read
@@ -1159,7 +1182,7 @@ ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
 bool VerifyHttpRequest(const InputMessageBase* msg) {
     Server* server = (Server*)msg->arg();
     Socket* socket = msg->socket();
-    
+
     HttpContext* http_request = (HttpContext*)msg;
     const Authenticator* auth = server->options().auth;
     if (NULL == auth) {
@@ -1177,7 +1200,7 @@ bool VerifyHttpRequest(const InputMessageBase* msg) {
         return true;
     }
 
-    const std::string *authorization 
+    const std::string *authorization
         = http_request->header().GetHeader("Authorization");
     if (authorization == NULL) {
         return false;
@@ -1222,6 +1245,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         resp_sender.set_h2_stream_id(h2_sctx->stream_id());
     }
 
+    cntl->set_begin_rpc_time_us(butil::gettimeofday_us());
     ControllerPrivateAccessor accessor(cntl);
     HttpHeader& req_header = cntl->http_request();
     imsg_guard->header().Swap(req_header);
@@ -1243,7 +1267,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         .set_request_protocol(PROTOCOL_HTTP)
         .set_begin_time_us(msg->received_us())
         .move_in_server_receiving_sock(socket_guard);
-    
+
     // Read log-id. errno may be set when input to strtoull overflows.
     // atoi/atol/atoll don't support 64-bit integer and can't be used.
     const std::string* log_id_str = req_header.GetHeader(common->LOG_ID);
@@ -1252,7 +1276,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         errno = 0;
         uint64_t logid = strtoull(log_id_str->c_str(), &logid_end, 10);
         if (*logid_end || errno) {
-            LOG(ERROR) << "Invalid " << common->LOG_ID << '=' 
+            LOG(ERROR) << "Invalid " << common->LOG_ID << '='
                        << *log_id_str << " in http request";
         } else {
             cntl->set_log_id(logid);
@@ -1294,7 +1318,19 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         span->set_protocol(is_http2 ? PROTOCOL_H2 : PROTOCOL_HTTP);
         span->set_request_size(imsg_guard->parsed_length());
     }
+
+    logging::ColorLogHeader* log_header = nullptr;
+    if (!logging::ColorLogHeader::bls_color_log_header()) {
+        log_header = logging::CreateColorLogHeader();
+    } else {
+        log_header = logging::ColorLogHeader::bls_color_log_header();
+    }
+    if (log_header) {
+        log_header->InitFromeHttpHeader(req_header);
+    }
     
+    logging::ColorLogHeader::set_bls_color_log_header(log_header);
+
     if (!server->IsRunning()) {
         cntl->SetFailed(ELOGOFF, "Server is stopping");
         return;
@@ -1320,7 +1356,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         // `cntl', `req' and `res' will be deleted inside `done'
         return svc->CallMethod(md, cntl, NULL, NULL, done);
     }
-    
+
     const Server::MethodProperty* const sp =
         FindMethodPropertyByURI(path, server, &req_header._unresolved_path);
     if (NULL == sp) {
@@ -1352,7 +1388,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
             return;
         }
     }
-    
+
     if (span) {
         span->ResetServerSpanName(sp->method->full_name());
     }
@@ -1492,23 +1528,23 @@ void ProcessHttpRequest(InputMessageBase *msg) {
 }
 
 bool ParseHttpServerAddress(butil::EndPoint* point, const char* server_addr_and_port) {
-    std::string scheme;
+    std::string schema;
     std::string host;
     int port = -1;
-    if (ParseURL(server_addr_and_port, &scheme, &host, &port) != 0) {
+    if (ParseURL(server_addr_and_port, &schema, &host, &port) != 0) {
         LOG(ERROR) << "Invalid address=`" << server_addr_and_port << '\'';
         return false;
     }
-    if (scheme.empty() || scheme == "http") {
+    if (schema.empty() || schema == "http") {
         if (port < 0) {
             port = 80;
         }
-    } else if (scheme == "https") {
+    } else if (schema == "https") {
         if (port < 0) {
             port = 443;
         }
     } else {
-        LOG(ERROR) << "Invalid scheme=`" << scheme << '\'';
+        LOG(ERROR) << "Invalid schema=`" << schema << '\'';
         return false;
     }
     if (str2endpoint(host.c_str(), port, point) != 0 &&

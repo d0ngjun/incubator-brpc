@@ -1,20 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Copyright (c) 2015 Baidu, Inc.
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Author: Ge,Jun (gejun@baidu.com)
 // Date: Thu Jul 30 17:44:54 CST 2015
 
 #include <unistd.h>                        // getpagesize
@@ -140,12 +138,12 @@ public:
     // this .cpp utilizing this class generally return a struct with 32-bit
     // and 64-bit numbers.
     template <typename ReadFn>
-    static const T& get_value(const ReadFn& fn) {
+    static const T& get_value(const ReadFn& fn, int64_t inteval = CACHED_INTERVAL_US) {
         CachedReader* p = butil::get_leaky_singleton<CachedReader>();
         const int64_t now = butil::gettimeofday_us();
-        if (now > p->_mtime_us + CACHED_INTERVAL_US) {
+        if (now > p->_mtime_us + inteval) {
             pthread_mutex_lock(&p->_mutex);
-            if (now > p->_mtime_us + CACHED_INTERVAL_US) {
+            if (now > p->_mtime_us + inteval) {
                 p->_mtime_us = now;
                 pthread_mutex_unlock(&p->_mutex);
                 // don't run fn inside lock otherwise a slow fn may
@@ -167,6 +165,55 @@ private:
     int64_t _mtime_us;
     pthread_mutex_t _mutex;
     T _cached;
+};
+
+// Reduce pressures to functions to get system metrics.
+template <typename T, typename D>
+class CacheDiffer {
+public:
+    CacheDiffer() : _mtime_us(0) {
+        CHECK_EQ(0, pthread_mutex_init(&_mutex, NULL));
+    }
+    ~CacheDiffer() {
+        pthread_mutex_destroy(&_mutex);
+    }
+
+    // NOTE: may return a volatile value that may be overwritten at any time.
+    // This is acceptable right now. Both 32-bit and 64-bit numbers are atomic
+    // to fetch in 64-bit machines(most of baidu machines) and the code inside
+    // this .cpp utilizing this class generally return a struct with 32-bit
+    // and 64-bit numbers.
+    template <typename ReadFn, typename DiffFn>
+    static const D& get_diff(const ReadFn& rfn, const DiffFn& dfn) {
+        CacheDiffer* p = butil::get_leaky_singleton<CacheDiffer>();
+        const int64_t now = butil::gettimeofday_us();
+        if (now > p->_mtime_us + CACHED_INTERVAL_US) {
+            pthread_mutex_lock(&p->_mutex);
+            if (now > p->_mtime_us + CACHED_INTERVAL_US) {
+                p->_mtime_us = now;
+                pthread_mutex_unlock(&p->_mutex);
+                // don't run rfn inside lock otherwise a slow rfn may
+                // block all concurrent bvar dumppers. (e.g. /vars)
+                T result;
+                if (rfn(&result)) {
+                    pthread_mutex_lock(&p->_mutex);
+                    D diff = dfn(result, p->_cached);
+                    p->_cached = result;
+                    p->_diff = diff;
+                } else {
+                    pthread_mutex_lock(&p->_mutex);
+                }
+            }
+            pthread_mutex_unlock(&p->_mutex);
+        }
+        return p->_diff;
+    }
+
+private:
+    int64_t _mtime_us;
+    pthread_mutex_t _mutex;
+    T _cached;
+    D _diff;
 };
 
 class ProcStatReader {
@@ -324,6 +371,209 @@ public:
         name,                                                           \
         LoadAverageReader::get_field<BVAR_MEMBER_TYPE(&LoadAverage::field), \
         offsetof(LoadAverage, field)>, NULL);
+
+// ==================================================
+
+struct MemInfo {
+    long long mem_total;
+    long long mem_free;
+    // other ...
+};
+
+static bool read_mem_info(MemInfo &m) {
+#if defined(OS_LINUX)
+    butil::ScopedFILE fp("/proc/meminfo", "r");
+    if (NULL == fp) {
+        PLOG_ONCE(WARNING) << "Fail to open /proc/meminfo";
+        return false;
+    }
+    m = MemInfo();
+    errno = 0;
+    if (fscanf(fp, "%*s %lld %*s",
+               &m.mem_total) != 1) {
+        PLOG(WARNING) << "Fail to fscanf";
+        return false;
+    }
+    if (fscanf(fp, "%*s %lld %*s",
+               &m.mem_free) != 1) {
+        PLOG(WARNING) << "Fail to fscanf";
+        return false;
+    }
+    return true;
+#elif defined(OS_MACOSX)
+    return false;
+#else
+    return false;
+#endif
+}
+
+class MemInfoReader {
+public:
+    bool operator()(MemInfo* stat) const {
+        return read_mem_info(*stat);
+    };
+    template <typename T, size_t offset>
+    static T get_field(void*) {
+        return *(T*)((char*)&CachedReader<MemInfo>::get_value(
+                         MemInfoReader()) + offset);
+    }
+};
+
+#define BVAR_DEFINE_MEM_INFO_FIELD(field, name)                     \
+    PassiveStatus<BVAR_MEMBER_TYPE(&MemInfo::field)> g_##field(     \
+        name,                                                           \
+        MemInfoReader::get_field<BVAR_MEMBER_TYPE(&MemInfo::field), \
+        offsetof(MemInfo, field)>, NULL);
+
+// ==================================================
+struct CpuAmount {
+    long long user;
+    long long nice; 
+    long long system;
+    long long idle;
+    long long iowait;
+    long long irq;
+    long long softirq;
+    long long steal;
+    long long total() const {
+        return (user + system + nice + idle + iowait +
+            irq + softirq + steal);
+    }
+};
+
+struct CpuUsage {
+    double user;
+    double nice;
+    double system;
+    double idle;
+    double iowait;
+    double irq;
+    double softirq;
+    double steal;
+};
+
+static bool read_cpu_amount(CpuAmount &m) {
+#if defined(OS_LINUX)
+    m = CpuAmount();
+    butil::ScopedFILE fp("/proc/stat", "r");
+    if (NULL == fp) {
+        PLOG_ONCE(WARNING) << "Fail to open /proc/stat";
+        return false;
+    }
+    errno = 0;
+    if (fscanf(fp, "cpu %lld %lld %lld %lld %lld %lld %lld %lld",
+            &m.user,
+            &m.nice,
+            &m.system,
+            &m.idle,
+            &m.iowait,
+            &m.irq,
+            &m.softirq,
+            &m.steal) != 8) {
+        PLOG(WARNING) << "Fail to fscanf";
+        return false;
+    }
+    return true;
+#elif defined(OS_MACOSX)
+    return false;
+#else
+    return false;
+#endif
+}
+
+class CpuUsageReader {
+public:
+    class CpuAmountReader {
+        public:
+            bool operator()(CpuAmount* stat) const {
+                return read_cpu_amount(*stat);
+            }
+    };
+    CpuUsage operator()(const CpuAmount& new_ca, const CpuAmount& old_ca) const {
+        CpuUsage cu;
+        double total_diff = new_ca.total() - old_ca.total();
+        cu.user = (new_ca.user - old_ca.user) / total_diff * 100;
+        cu.system = (new_ca.system - old_ca.system) / total_diff * 100;
+        cu.nice = (new_ca.nice - old_ca.nice) / total_diff * 100;
+        cu.idle = (new_ca.idle - old_ca.idle) / total_diff * 100;
+        cu.iowait = (new_ca.iowait - old_ca.iowait) / total_diff * 100;
+        cu.irq = (new_ca.irq - old_ca.irq) / total_diff * 100;
+        cu.softirq = (new_ca.softirq - old_ca.softirq) / total_diff * 100;
+        cu.steal = (new_ca.steal - old_ca.steal) / total_diff * 100;
+        return cu;
+    };
+    template <typename D, size_t offset>
+    static D get_field(void*) {
+        return *(D*)((char*)&CacheDiffer<CpuAmount, CpuUsage>::get_diff(
+                    CpuUsageReader::CpuAmountReader(), CpuUsageReader()) + offset);
+    }
+};
+
+#define BVAR_DEFINE_CPU_USAGE_FIELD(field, name)                     \
+    PassiveStatus<BVAR_MEMBER_TYPE(&CpuUsage::field)> g_CpuUsage_##field(     \
+        name,                                                           \
+        CpuUsageReader::get_field<BVAR_MEMBER_TYPE(&CpuUsage::field), \
+        offsetof(CpuUsage, field)>, NULL);
+
+// ==================================================
+
+struct DiskUsage {
+    //1K-blocks
+    long long total;
+    long long used;
+    long long available;
+    double available_rate;
+};
+
+static bool read_disk_usage(DiskUsage &m) {
+#if defined(OS_LINUX)
+    m = DiskUsage();
+    std::stringstream ss;
+    if (butil::read_command_output(ss, "df |sed '1d'") != 0) {
+        LOG(ERROR) << "Fail to read df |sed '1d'";
+        return -1;
+    }
+    
+    long long total = 0;
+    long long used = 0;
+    long long available = 0;
+    std::string line;
+    while (std::getline(ss, line)) {         
+        if (sscanf(line.c_str(), "%*s %lld %lld %lld",
+               &total, &used, &available) != 3) {
+            PLOG(WARNING) << "Fail to sscanf";
+            return false;
+        }
+        m.total += total;
+        m.used += used;
+        m.available += available;
+    }
+    m.available_rate = (double)m.available * 100 / m.total;
+    return true;
+#elif defined(OS_MACOSX)
+    return false;
+#else
+    return false;
+#endif
+}
+
+class DiskUsageReader {
+public:
+    bool operator()(DiskUsage* stat) const {
+        return read_disk_usage(*stat);
+    };
+    template <typename T, size_t offset>
+    static T get_field(void*) {
+        return *(T*)((char*)&CachedReader<DiskUsage>::get_value(
+                         DiskUsageReader(), CACHED_INTERVAL_US*1000) + offset);
+    }
+};
+
+#define BVAR_DEFINE_DISK_USAGE_FIELD(field, name)                     \
+    PassiveStatus<BVAR_MEMBER_TYPE(&DiskUsage::field)> g_DiskUsage_##field(     \
+        name,                                                           \
+        DiskUsageReader::get_field<BVAR_MEMBER_TYPE(&DiskUsage::field), \
+        offsetof(DiskUsage, field)>, NULL);
 
 // ==================================================
 
@@ -698,6 +948,23 @@ BVAR_DEFINE_LOAD_AVERAGE_FIELD(loadavg_1m, "system_loadavg_1m");
 BVAR_DEFINE_LOAD_AVERAGE_FIELD(loadavg_5m, "system_loadavg_5m");
 BVAR_DEFINE_LOAD_AVERAGE_FIELD(loadavg_15m, "system_loadavg_15m");
 
+BVAR_DEFINE_MEM_INFO_FIELD(mem_total, "system_mem_total");
+BVAR_DEFINE_MEM_INFO_FIELD(mem_free, "system_mem_free");
+
+BVAR_DEFINE_CPU_USAGE_FIELD(user, "system_cpu_usage_user");
+BVAR_DEFINE_CPU_USAGE_FIELD(system, "system_cpu_usage_system");
+BVAR_DEFINE_CPU_USAGE_FIELD(nice, "system_cpu_usage_nice");
+BVAR_DEFINE_CPU_USAGE_FIELD(idle, "system_cpu_usage_idle");
+BVAR_DEFINE_CPU_USAGE_FIELD(iowait, "system_cpu_usage_iowait");
+BVAR_DEFINE_CPU_USAGE_FIELD(irq, "system_cpu_usage_irq");
+BVAR_DEFINE_CPU_USAGE_FIELD(softirq, "system_cpu_usage_softirq");
+BVAR_DEFINE_CPU_USAGE_FIELD(steal, "system_cpu_usage_steal");
+/*
+BVAR_DEFINE_DISK_USAGE_FIELD(total, "system_disk_total")
+BVAR_DEFINE_DISK_USAGE_FIELD(used, "system_disk_used")
+BVAR_DEFINE_DISK_USAGE_FIELD(available, "system_disk_available")
+BVAR_DEFINE_DISK_USAGE_FIELD(available_rate, "system_disk_usage_available")
+*/
 BVAR_DEFINE_PROC_IO_FIELD(rchar);
 BVAR_DEFINE_PROC_IO_FIELD(wchar);
 PerSecond<PassiveStatus<size_t> > g_io_read_second(
@@ -746,7 +1013,7 @@ inline std::ostream& operator<<(std::ostream& os, const TimePercent& tp) {
         return os << "0";
     } else {
         return os << std::fixed << std::setprecision(3)
-                  << (double)tp.time_us / tp.real_time_us;
+                  << (double)tp.time_us * 100 / tp.real_time_us; //percent
     }
 }
 

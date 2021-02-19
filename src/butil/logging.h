@@ -1,20 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2012 Baidu, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2012-10-08 23:53:50
 
 // Merged chromium log and streaming log.
@@ -32,7 +30,7 @@
 #include "butil/atomicops.h" // Used by LOG_EVERY_N, LOG_FIRST_N etc
 #include "butil/time.h"      // gettimeofday_us()
 
-#if 1
+#if BRPC_WITH_GLOG
 # include <glog/logging.h>
 # include <glog/raw_logging.h>
 // define macros that not implemented in glog
@@ -43,12 +41,12 @@
 #    define DCHECK_IS_ON() 1
 #  endif  // NDEBUG
 # endif // DCHECK_IS_ON
-# if DCHECK_IS_ON() 
+# if DCHECK_IS_ON()
 #  define DPLOG(...) PLOG(__VA_ARGS__)
 #  define DPLOG_IF(...) PLOG_IF(__VA_ARGS__)
 #  define DPCHECK(...) PCHECK(__VA_ARGS__)
 #  define DVPLOG(...) VLOG(__VA_ARGS__)
-# else 
+# else
 #  define DPLOG(...) DLOG(__VA_ARGS__)
 #  define DPLOG_IF(...) DLOG_IF(__VA_ARGS__)
 #  define DPCHECK(...) DCHECK(__VA_ARGS__)
@@ -56,6 +54,9 @@
 # endif
 
 #define LOG_AT(severity, file, line)                                    \
+    google::LogMessage(file, line, google::severity).stream()
+
+#define LOG_LUA_AT(severity, file, line, func)                          \
     google::LogMessage(file, line, google::severity).stream()
 
 #else
@@ -76,12 +77,14 @@
 #include <inttypes.h>
 #include <gflags/gflags_declare.h>
 
+#include "butil/iobuf.h"
 #include "butil/base_export.h"
 #include "butil/basictypes.h"
 #include "butil/debug/debugger.h"
 #include "butil/strings/string_piece.h"
 #include "butil/build_config.h"
 #include "butil/synchronization/lock.h"
+
 //
 // Optional message capabilities
 // -----------------------------
@@ -205,14 +208,17 @@ namespace logging {
 // TODO(avi): do we want to do a unification of character types here?
 #if defined(OS_WIN)
 typedef wchar_t PathChar;
+typedef std::wstring PathString;
 #else
 typedef char PathChar;
+typedef std::string PathString;
 #endif
 
+bool LogIsOn(int severity);
 // Where to record logging output? A flat file and/or system debug log
 // via OutputDebugString.
 enum LoggingDestination {
-    LOG_TO_NONE             = 0,
+    LOG_NONE                = 0,
     LOG_TO_FILE             = 1 << 0,
     LOG_TO_SYSTEM_DEBUG_LOG = 1 << 1,
 
@@ -257,9 +263,12 @@ struct BUTIL_EXPORT LoggingSettings {
     const PathChar* log_file;
     LogLockingState lock_log;
     OldFileDeletionState delete_old;
+    std::string module_name;
+    std::string logd_module_name;
+    bool async;
 };
 
-// Implementation of the InitLogging() method declared below. 
+// Implementation of the InitLogging() method declared below.
 BUTIL_EXPORT bool BaseInitLoggingImpl(const LoggingSettings& settings);
 
 // Sets the log file name and other global logging state. Calling this function
@@ -323,7 +332,7 @@ BUTIL_EXPORT LogSink* SetLogSink(LogSink* sink);
 class StringSink : public LogSink, public std::string {
 public:
     bool OnLogMessage(int severity, const char* file, int line,
-                 const butil::StringPiece& log_content) override;
+                 const butil::StringPiece& log_content);
 private:
     butil::Lock _lock;
 };
@@ -332,35 +341,19 @@ typedef int LogSeverity;
 const LogSeverity BLOG_VERBOSE = -1;  // This is level 1 verbosity
 // Note: the log severities are used to index into the array of names,
 // see log_severity_names.
-const LogSeverity BLOG_INFO = 0;
-const LogSeverity BLOG_NOTICE = 1;
-const LogSeverity BLOG_WARNING = 2;
-const LogSeverity BLOG_ERROR = 3;
-const LogSeverity BLOG_FATAL = 4;
-const int LOG_NUM_SEVERITIES = 5;
-
-// COMBLOG_TRACE is just INFO
-const LogSeverity BLOG_TRACE = BLOG_INFO;
-
-// COMBLOG_DEBUG equals INFO in debug mode and verbose in normal mode.
-#ifndef NDEBUG
-const LogSeverity BLOG_DEBUG = BLOG_INFO;
-#else
-const LogSeverity BLOG_DEBUG = BLOG_VERBOSE;
-#endif
-
-// BLOG_DFATAL is BLOG_FATAL in debug mode, ERROR in normal mode
-#ifndef NDEBUG
-const LogSeverity BLOG_DFATAL = BLOG_FATAL;
-#else
-const LogSeverity BLOG_DFATAL = BLOG_ERROR;
-#endif
+const LogSeverity BLOG_KERNEL = 0;
+const LogSeverity BLOG_DEBUG = 1;
+const LogSeverity BLOG_INFO = 2;
+const LogSeverity BLOG_WARNING = 3;
+const LogSeverity BLOG_ERROR = 4;
+const LogSeverity BLOG_FATAL = 5;
+const int LOG_NUM_SEVERITIES = 6;
 
 // A few definitions of macros that don't generate much code. These are used
 // by LOG() and LOG_IF, etc. Since these are used all over our code, it's
 // better to have compact code for these operations.
 #define BAIDU_COMPACT_LOG_EX(severity, ClassName, ...)  \
-    ::logging::ClassName(__FILE__, __LINE__,            \
+    ::logging::ClassName(__FILE__, __LINE__, __FUNCTION__, \
     ::logging::BLOG_##severity, ##__VA_ARGS__)
 
 #define BAIDU_COMPACK_LOG(severity)             \
@@ -381,8 +374,10 @@ const LogSeverity BLOG_0 = BLOG_ERROR;
 // As special cases, we can assume that LOG_IS_ON(FATAL) always holds. Also,
 // LOG_IS_ON(DFATAL) always holds in debug mode. In particular, CHECK()s will
 // always fire if they fail.
-#define LOG_IS_ON(severity)                                     \
-    (::logging::BLOG_##severity >= ::logging::GetMinLogLevel())
+
+// 
+#define LOG_IS_ON(severity) \
+    logging::LogIsOn(logging::BLOG_##severity)
 
 #if defined(__GNUC__)
 // We emit an anonymous static int* variable at every VLOG_IS_ON(n) site.
@@ -391,13 +386,13 @@ const LogSeverity BLOG_0 = BLOG_ERROR;
 // it's either FLAGS_verbose or an appropriate internal variable
 // matching the current source file that represents results of
 // parsing of --vmodule flag and/or SetVLOGLevel calls.
-# define BAIDU_VLOG_IS_ON(verbose_level, filepath)                      \
-    ({ static const int* vlocal = &::logging::VLOG_UNINITIALIZED;       \
-        const int saved_verbose_level = (verbose_level);                \
-        (saved_verbose_level >= 0)/*VLOG(-1) is forbidden*/ &&          \
-            (*vlocal >= saved_verbose_level) &&                         \
-            ((vlocal != &::logging::VLOG_UNINITIALIZED) ||              \
-             (::logging::add_vlog_site(&vlocal, filepath, __LINE__,     \
+# define BAIDU_VLOG_IS_ON(verbose_level, filepath)                   \
+    ({ static const int* vlocal = &::logging::VLOG_UNINITIALIZED;    \
+        const int saved_verbose_level = (verbose_level);             \
+        (saved_verbose_level >= 0)/*VLOG(-1) is forbidden*/ &&       \
+            (*vlocal >= saved_verbose_level) &&                      \
+            ((vlocal != &::logging::VLOG_UNINITIALIZED) ||           \
+             (::logging::add_vlog_site(&vlocal, filepath, __LINE__,  \
                                        saved_verbose_level))); })
 #else
 // GNU extensions not available, so we do not support --vmodule.
@@ -409,8 +404,14 @@ const LogSeverity BLOG_0 = BLOG_ERROR;
 #define VLOG_IS_ON(verbose_level) BAIDU_VLOG_IS_ON(verbose_level, __FILE__)
 
 DECLARE_int32(v);
+DECLARE_string(log_directory);
 
 extern const int VLOG_UNINITIALIZED;
+
+void print_log_prefix(std::ostream& os,
+    int severity, const char* file, int line);
+
+PathString GetProcessName();
 
 // Called to initialize a VLOG callsite.
 bool add_vlog_site(const int** v, const PathChar* filename, int line_no,
@@ -445,10 +446,11 @@ void print_vlog_sites(VLogSitePrinter*);
 // ostream. We employ a neat hack by calling the stream() member
 // function of LogMessage which seems to avoid the problem.
 #define LOG_STREAM(severity) BAIDU_COMPACK_LOG(severity).stream()
-
-#define LOG(severity)                                                   \
+   
+#define LOG(severity)    \
     BAIDU_LAZY_STREAM(LOG_STREAM(severity), LOG_IS_ON(severity))
-#define LOG_IF(severity, condition)                                     \
+
+#define LOG_IF(severity, condition)    \
     BAIDU_LAZY_STREAM(LOG_STREAM(severity), LOG_IS_ON(severity) && (condition))
 
 // FIXME(gejun): Should always crash.
@@ -472,14 +474,20 @@ void print_vlog_sites(VLogSitePrinter*);
 // file/line can be specified at running-time. This is useful for printing
 // logs with known file/line inside a LogSink or LogMessageHandler
 #define LOG_AT_STREAM(severity, file, line)                             \
-    ::logging::LogMessage(file, line, ::logging::BLOG_##severity).stream()
+    ::logging::LogMessage(file, line, __FUNCTION__, ::logging::BLOG_##severity).stream()
 
 #define LOG_AT(severity, file, line)                                    \
     BAIDU_LAZY_STREAM(LOG_AT_STREAM(severity, file, line), LOG_IS_ON(severity))
 
+#define LOG_LUA_AT_STREAM(severity, file, line, func)                   \
+    ::logging::LogMessage(file, line, func, ::logging::BLOG_##severity).stream()
+
+#define LOG_LUA_AT(severity, file, line, func)                          \
+    BAIDU_LAZY_STREAM(LOG_LUA_AT_STREAM(severity, file, line, func), LOG_IS_ON(severity))
+
 // The VLOG macros log with negative verbosities.
 #define VLOG_STREAM(verbose_level)                                      \
-    ::logging::LogMessage(__FILE__, __LINE__, -(verbose_level)).stream()
+    ::logging::LogMessage(__FILE__, __LINE__, __FUNCTION__, -(verbose_level)).stream()
 
 #define VLOG(verbose_level)                                             \
     BAIDU_LAZY_STREAM(VLOG_STREAM(verbose_level), VLOG_IS_ON(verbose_level))
@@ -507,11 +515,11 @@ void print_vlog_sites(VLogSitePrinter*);
 
 #if defined (OS_WIN)
 #define VPLOG_STREAM(verbose_level)                                     \
-     ::logging::Win32ErrorLogMessage(__FILE__, __LINE__, -verbose_level, \
+     ::logging::Win32ErrorLogMessage(__FILE__, __LINE__, __FUNCTION__, -verbose_level, \
                                      ::logging::GetLastSystemErrorCode()).stream()
 #elif defined(OS_POSIX)
 #define VPLOG_STREAM(verbose_level)                                     \
-    ::logging::ErrnoLogMessage(__FILE__, __LINE__, -verbose_level,      \
+    ::logging::ErrnoLogMessage(__FILE__, __LINE__, __FUNCTION__, -verbose_level,      \
                                ::logging::GetLastSystemErrorCode()).stream()
 #endif
 
@@ -582,7 +590,7 @@ void print_vlog_sites(VLogSitePrinter*);
     if (std::string* _result =                                          \
         ::logging::Check##name##Impl((val1), (val2),                    \
                                      #val1 " " #op " " #val2))          \
-        ::logging::LogMessage(__FILE__, __LINE__, _result).stream().SetCheck()
+        ::logging::LogMessage(__FILE__, __LINE__, __FUNCTION__, _result).stream().SetCheck()
 
 #endif
 
@@ -810,7 +818,7 @@ const LogSeverity BLOG_DCHECK = BLOG_INFO;
             ::logging::Check##name##Impl((val1), (val2),                \
                                          #val1 " " #op " " #val2))      \
             ::logging::LogMessage(                                      \
-                __FILE__, __LINE__, ::logging::BLOG_DCHECK,             \
+                __FILE__, __LINE__, __FUNCTION__, ::logging::BLOG_DCHECK,             \
                 _result).stream()
 
 // Equality/Inequality checks - compare two values, and log a
@@ -859,8 +867,8 @@ public:
     explicit CharArrayStreamBuf() : _data(NULL), _size(0) {}
     ~CharArrayStreamBuf();
 
-    int overflow(int ch) override;
-    int sync() override;
+    virtual int overflow(int ch);
+    virtual int sync();
     void reset();
 
 private:
@@ -875,7 +883,7 @@ friend void DestroyLogStream(LogStream*);
 public:
     LogStream()
         : std::ostream(this), _file("-"), _line(0), _severity(0)
-        , _noflush(false), _is_check(false) {
+        , _noflush(false), _is_check(false), func_name_(nullptr) {
     }
 
     ~LogStream() {
@@ -898,7 +906,7 @@ public:
     }
 
     // Reset the log prefix: "I0711 15:14:01.830110 12735 server.cpp:93] "
-    LogStream& SetPosition(const PathChar* file, int line, LogSeverity);
+    LogStream& SetPosition(const PathChar* file, int line, const char* func_name, LogSeverity);
 
     // Make FlushIfNeed() no-op once.
     LogStream& DontFlushOnce() {
@@ -913,6 +921,12 @@ public:
 
     bool empty() const { return pbase() == pptr(); }
 
+    butil::IOBuf content_iobuf() const {  
+        butil::IOBuf ib;
+        ib.append(pbase(), pptr() - pbase());
+        return ib;
+    }
+
     butil::StringPiece content() const
     { return butil::StringPiece(pbase(), pptr() - pbase()); }
 
@@ -922,7 +936,7 @@ public:
     const PathChar* file() const { return _file; }
     int line() const { return _line; }
     LogSeverity severity() const { return _severity; }
-
+    const char* func_name() { return func_name_; }
 private:
     void FlushWithoutReset();
 
@@ -948,6 +962,7 @@ private:
     LogSeverity _severity;
     bool _noflush;
     bool _is_check;
+    const char* func_name_;
 };
 
 // This class more or less represents a particular log message.  You
@@ -962,14 +977,14 @@ private:
 class BUTIL_EXPORT LogMessage {
 public:
     // Used for LOG(severity).
-    LogMessage(const char* file, int line, LogSeverity severity);
+    LogMessage(const char* file, int line, const char* func_name, LogSeverity severity);
 
     // Used for CHECK_EQ(), etc. Takes ownership of the given string.
     // Implied severity = BLOG_FATAL.
-    LogMessage(const char* file, int line, std::string* result);
+    LogMessage(const char* file, int line, const char* func_name, std::string* result);
 
     // Used for DCHECK_EQ(), etc. Takes ownership of the given string.
-    LogMessage(const char* file, int line, LogSeverity severity,
+    LogMessage(const char* file, int line, const char* func_name, LogSeverity severity,
                std::string* result);
 
     ~LogMessage();
@@ -986,7 +1001,7 @@ private:
 // A non-macro interface to the log facility; (useful
 // when the logging level is not a compile-time constant).
 inline void LogAtLevel(int const log_level, const butil::StringPiece &msg) {
-    LogMessage(__FILE__, __LINE__, log_level).stream() << msg;
+    LogMessage(__FILE__, __LINE__, __FUNCTION__, log_level).stream() << msg;
 }
 
 // This class is used to explicitly ignore values in the conditional
@@ -1006,6 +1021,7 @@ class BUTIL_EXPORT Win32ErrorLogMessage {
 public:
     Win32ErrorLogMessage(const char* file,
                          int line,
+                         const char* func_name,
                          LogSeverity severity,
                          SystemErrorCode err);
 
@@ -1026,6 +1042,7 @@ class BUTIL_EXPORT ErrnoLogMessage {
 public:
     ErrnoLogMessage(const char* file,
                     int line,
+                    const char* func_name,
                     LogSeverity severity,
                     SystemErrorCode err);
 

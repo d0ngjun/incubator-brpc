@@ -51,6 +51,9 @@ typedef CR_FORWARD_ENUM(unsigned int, NSSearchPathDirectory);
 typedef unsigned int NSSearchPathDomainMask;
 #endif
 
+typedef struct OpaqueSecTrustRef* SecACLRef;
+typedef struct OpaqueSecTrustedApplicationRef* SecTrustedApplicationRef;
+
 namespace butil {
 
 class FilePath;

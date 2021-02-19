@@ -1,20 +1,20 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2014 Baidu, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
+//          Rujie Jiang(jiangrujie@baidu.com)
+//          Zhangyi Chen(chenzhangyi01@baidu.com)
 
 #include <signal.h>
 #include <openssl/md5.h>
@@ -41,7 +41,7 @@
 #include "brpc/retry_policy.h"
 #include "brpc/stream_impl.h"
 #include "brpc/policy/streaming_rpc_protocol.h" // FIXME
-#include "brpc/rpc_dump.h"
+#include "brpc/rpc_dump.pb.h"
 #include "brpc/details/usercode_backup_pool.h"  // RunUserCode
 #include "brpc/mongo_service_adaptor.h"
 
@@ -159,7 +159,7 @@ void Controller::ResetNonPods() {
         _server->_session_local_data_pool->Return(_session_local_data);
     }
     _mongo_session_data.reset();
-    delete _sampled_request;
+    delete _rpc_dump_meta;
 
     if (!is_used_by_rpc() && _correlation_id != INVALID_BTHREAD_ID) {
         CHECK_NE(EPERM, bthread_id_cancel(_correlation_id));
@@ -213,7 +213,7 @@ void Controller::ResetPods() {
     _server = NULL;
     _oncancel_id = INVALID_BTHREAD_ID;
     _auth_context = NULL;
-    _sampled_request = NULL;
+    _rpc_dump_meta = NULL;
     _request_protocol = PROTOCOL_UNKNOWN;
     _max_retry = UNSET_MAGIC_NUM;
     _retry_policy = NULL;
@@ -226,6 +226,8 @@ void Controller::ResetPods() {
     _timeout_id = 0;
     _begin_time_us = 0;
     _end_time_us = 0;
+    _begin_rpc_time_us = 0;
+    _end_rpc_time_us = 0;
     _tos = 0;
     _preferred_index = -1;
     _request_compress_type = COMPRESS_TYPE_NONE;
@@ -257,7 +259,6 @@ void Controller::ResetPods() {
 Controller::Call::Call(Controller::Call* rhs)
     : nretry(rhs->nretry)
     , need_feedback(rhs->need_feedback)
-    , enable_circuit_breaker(rhs->enable_circuit_breaker)
     , peer_id(rhs->peer_id)
     , begin_time_us(rhs->begin_time_us)
     , sending_sock(rhs->sending_sock.release())
@@ -691,7 +692,7 @@ inline bool does_error_affect_main_socket(int error_code) {
         error_code == EINVAL/*returned by connect "0.0.0.1"*/;
 }
 
-//Note: A RPC call is probably consisted by several individual Calls such as
+//Note: A RPC call is probably consisted by serveral individual Calls such as
 //      retries and backup requests. This method simply cares about the error of
 //      this very Call (specified by |error_code|) rather than the error of the
 //      entire RPC (specified by c->FailedInline()).
@@ -828,7 +829,7 @@ void Controller::EndRPC(const CompletionInfo& info) {
                          << info.id << " current_cid=" << current_id()
                          << " initial_cid=" << _correlation_id
                          << " stream_user_data=" << _current_call.stream_user_data
-                         << " sending_sock=" << _current_call.sending_sock.get();
+                         << " sending_sock=" << *_current_call.sending_sock;
         }
         _current_call.OnComplete(this, ECANCELED, false, false);
         if (_unfinished_call != NULL) {
@@ -870,6 +871,8 @@ void Controller::EndRPC(const CompletionInfo& info) {
             SubmitSpan();
         }
     }
+
+    _boss_guard.Mcall(this);
 
     // No need to retry or can't retry, just call user's `done'.
     const CallId saved_cid = _correlation_id;
@@ -1037,7 +1040,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     }
     // Handle connection type
     if (_connection_type == CONNECTION_TYPE_SINGLE ||
-        _stream_creator != NULL) { // let user decides the sending_sock
+        _stream_creator != NULL) { // let user decides the sending_socket
         // in the callback(according to connection_type) directly
         _current_call.sending_sock.reset(tmp_sock.release());
         // TODO(gejun): Setting preferred index of single-connected socket
@@ -1332,9 +1335,9 @@ void WebEscape(const std::string& source, std::string* output) {
     }
 }
 
-void Controller::reset_sampled_request(SampledRequest* req) {
-    delete _sampled_request;
-    _sampled_request = req;
+void Controller::reset_rpc_dump_meta(RpcDumpMeta* meta) {
+    delete _rpc_dump_meta;
+    _rpc_dump_meta = meta;
 }
 
 void Controller::set_stream_creator(StreamCreator* sc) {
@@ -1345,7 +1348,7 @@ void Controller::set_stream_creator(StreamCreator* sc) {
     _stream_creator = sc;
 }
 
-butil::intrusive_ptr<ProgressiveAttachment>
+ProgressiveAttachment*
 Controller::CreateProgressiveAttachment(StopStyle stop_style) {
     if (has_progressive_writer()) {
         LOG(ERROR) << "One controller can only have one ProgressiveAttachment";
@@ -1365,9 +1368,10 @@ Controller::CreateProgressiveAttachment(StopStyle stop_style) {
     if (stop_style == FORCE_STOP) {
         httpsock->fail_me_at_server_stop();
     }
-    _wpa.reset(new ProgressiveAttachment(
-                   httpsock, http_request().before_http_1_1()));
-    return _wpa;
+    ProgressiveAttachment* pb = new ProgressiveAttachment(
+        httpsock, http_request().before_http_1_1());
+    _wpa.reset(pb);
+    return pb;
 }
 
 void Controller::ReadProgressiveAttachmentBy(ProgressiveReader* r) {
@@ -1416,6 +1420,10 @@ int Controller::GetSockOption(int level, int optname, void* optval, socklen_t* o
         errno = EBADF;
         return -1;
     }
+}
+
+void Controller::set_boss_guard(const BossGuard& boss_guard) {
+    _boss_guard = boss_guard;
 }
 
 #if defined(OS_MACOSX)

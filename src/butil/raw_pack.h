@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Copyright (c) 2014 Baidu, Inc.
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #ifndef BUTIL_RAW_PACK_H
 #define BUTIL_RAW_PACK_H
@@ -48,6 +45,25 @@ public:
 
     // Not using operator<< because some values may be packed differently from
     // its type.
+
+    RawPacker& pack(const char* host_value, size_t len) {
+        memcpy(_stream, host_value, len);
+        _stream += len;
+        return *this;
+    }
+
+    RawPacker& pack8(uint32_t host_value) {
+        *(uint8_t*)_stream = host_value;
+        _stream += 1;
+        return *this;
+    }
+
+    RawPacker& pack16(uint16_t host_value) {
+        *(uint16_t*)_stream = HostToNet16(host_value);
+        _stream += 2;
+        return *this;
+    }
+
     RawPacker& pack32(uint32_t host_value) {
         *(uint32_t*)_stream = HostToNet32(host_value);
         _stream += 4;
@@ -72,6 +88,24 @@ class RawUnpacker {
 public:
     explicit RawUnpacker(const void* stream) : _stream((const char*)stream) {}
     ~RawUnpacker() {}
+
+    RawUnpacker& unpack(char* host_value, size_t len) {
+        memcpy(host_value, _stream, len);
+        _stream += len;
+        return *this;
+    }
+
+    RawUnpacker& unpack8(uint8_t & host_value) {
+        host_value = *(const uint8_t*)_stream;
+        _stream += 1;
+        return *this;
+    }
+
+    RawUnpacker& unpack16(uint16_t & host_value) {
+        host_value = NetToHost16(*(const uint16_t*)_stream);
+        _stream += 2;
+        return *this;
+    }
 
     RawUnpacker& unpack32(uint32_t & host_value) {
         host_value = NetToHost32(*(const uint32_t*)_stream);

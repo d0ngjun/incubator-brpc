@@ -1,20 +1,19 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Copyright (c) 2014 Baidu, Inc.
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
+//          Jiashun Zhu(zhujiashun@baidu.com)
 
 #include "brpc/policy/http2_rpc_protocol.h"
 #include "brpc/details/controller_private_accessor.h"
@@ -324,20 +323,14 @@ inline H2Context::FrameHandler FindFrameHandler(H2FrameType type) {
 
 H2Context::H2Context(Socket* socket, const Server* server)
     : _socket(socket)
-    // Maximize the window size to make sending big request possible before
-    // receving the remote settings.
-    , _remote_window_left(H2Settings::MAX_WINDOW_SIZE)
+    , _remote_window_left(H2Settings::DEFAULT_INITIAL_WINDOW_SIZE)
     , _conn_state(H2_CONNECTION_UNINITIALIZED)
     , _last_received_stream_id(-1)
     , _last_sent_stream_id(1)
     , _goaway_stream_id(-1)
-    , _remote_settings_received(false)
     , _deferred_window_update(0) {
     // Stop printing the field which is useless for remote settings.
     _remote_settings.connection_window_size = 0;
-    // Maximize the window size to make sending big request possible before
-    // receving the remote settings.
-    _remote_settings.stream_window_size = H2Settings::MAX_WINDOW_SIZE;
     if (server) {
         _unack_local_settings = server->options().h2_settings;
     } else {
@@ -864,28 +857,9 @@ H2ParseResult H2Context::OnSettings(
         return MakeH2Message(NULL);
     }
     const int64_t old_stream_window_size = _remote_settings.stream_window_size;
-    if (!_remote_settings_received) {
-        // To solve the problem that sender can't send large request before receving
-        // remote setting, the initial window size of stream/connection is set to
-        // MAX_WINDOW_SIZE(see constructor of H2Context).
-        // As a result, in the view of remote side, window size is 65535 by default so
-        // it may not send its stream size to sender, making stream size still be
-        // MAX_WINDOW_SIZE. In this case we need to revert this value to default.
-        H2Settings tmp_settings;
-        if (!ParseH2Settings(&tmp_settings, it, frame_head.payload_size)) {
-            LOG(ERROR) << "Fail to parse from SETTINGS";
-            return MakeH2Error(H2_PROTOCOL_ERROR);
-        }
-        _remote_settings = tmp_settings;
-        _remote_window_left.fetch_sub(
-                H2Settings::MAX_WINDOW_SIZE - H2Settings::DEFAULT_INITIAL_WINDOW_SIZE,
-                butil::memory_order_relaxed);
-        _remote_settings_received = true;
-    } else {
-        if (!ParseH2Settings(&_remote_settings, it, frame_head.payload_size)) {
-            LOG(ERROR) << "Fail to parse from SETTINGS";
-            return MakeH2Error(H2_PROTOCOL_ERROR);
-        }
+    if (!ParseH2Settings(&_remote_settings, it, frame_head.payload_size)) {
+        LOG(ERROR) << "Fail to parse from SETTINGS";
+        return MakeH2Error(H2_PROTOCOL_ERROR);
     }
     const int64_t window_diff =
         static_cast<int64_t>(_remote_settings.stream_window_size)
@@ -993,8 +967,8 @@ H2ParseResult H2Context::OnGoAway(
                                   BTHREAD_ATTR_PTHREAD :
                                   BTHREAD_ATTR_NORMAL);
             tmp.keytable_pool = _socket->keytable_pool();
-            CHECK_EQ(0, bthread_start_background(&th, &tmp, ProcessHttpResponseWrapper,
-                         static_cast<InputMessageBase*>(goaway_streams[i])));
+            CHECK_EQ(0, bthread_start_background(
+                         &th, &tmp, ProcessHttpResponseWrapper, goaway_streams[i]));
         }
         return MakeH2Message(goaway_streams[0]);
     } else {
@@ -1048,7 +1022,6 @@ void H2Context::Describe(std::ostream& os, const DescribeOptions& opt) const {
        << sep << "remote_conn_window_left="
        << _remote_window_left.load(butil::memory_order_relaxed)
        << sep << "remote_settings=" << _remote_settings
-       << sep << "remote_settings_received=" << _remote_settings_received
        << sep << "local_settings=" << _local_settings
        << sep << "hpacker={";
     IndentingOStream os2(os, 2);
@@ -1263,7 +1236,7 @@ int H2StreamContext::ConsumeHeaders(butil::IOBufBytesIterator& it) {
             case 's':
                 if (strcmp(name + 2, /*:s*/"cheme") == 0) {
                     matched = true;
-                    h.uri().set_scheme(pair.value);
+                    h.uri().set_schema(pair.value);
                 } else if (strcmp(name + 2, /*:s*/"tatus") == 0) {
                     matched = true;
                     char* endptr = NULL;
@@ -1408,7 +1381,7 @@ H2UnsentRequest* H2UnsentRequest::New(Controller* c) {
         msg->push(common->H2_METHOD) = HttpMethod2Str(h.method());
     }
     // :scheme
-    const std::string* scheme = &h.uri().scheme();
+    const std::string* scheme = &h.uri().schema();
     if (scheme->empty()) {
         scheme = (c->is_ssl() ? &common->H2_SCHEME_HTTPS :
                   &common->H2_SCHEME_HTTP);
@@ -1476,10 +1449,10 @@ private:
 
 void H2UnsentRequest::DestroyStreamUserData(SocketUniquePtr& sending_sock,
                                             Controller* cntl,
-                                            int error_code,
+                                            int /*error_code*/,
                                             bool /*end_of_rpc*/) {
     RemoveRefOnQuit deref_self(this);
-    if (sending_sock != NULL && error_code != 0) {
+    if (sending_sock != NULL && cntl->ErrorCode() != 0) {
         CHECK_EQ(cntl, _cntl);
         std::unique_lock<butil::Mutex> mu(_mutex);
         _cntl = NULL;
@@ -1551,7 +1524,7 @@ H2UnsentRequest::AppendAndDestroySelf(butil::IOBuf* out, Socket* socket) {
     }
 
     _sctx->Init(ctx, id);
-    // check flow control restriction
+    // flow control
     if (!_cntl->request_attachment().empty()) {
         const int64_t data_size = _cntl->request_attachment().size();
         if (!_sctx->ConsumeWindowSize(data_size)) {

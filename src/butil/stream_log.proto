@@ -1,0 +1,16 @@
+syntax="proto2";
+package qqnews;
+
+option cc_generic_services = true;
+
+message ConnectStreamRequest {
+    optional string url = 1;
+};
+
+message ConnectStreamResponse {
+};
+
+service LogService {
+      rpc ConnectStream(ConnectStreamRequest) returns (ConnectStreamResponse);
+};
+

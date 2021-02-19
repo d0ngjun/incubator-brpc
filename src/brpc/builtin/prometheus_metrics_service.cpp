@@ -1,20 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2018 Bilibili, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Jiashun Zhu(zhujiashun@bilibili.com)
 
 #include <vector>
 #include <iomanip>
@@ -25,6 +23,8 @@
 #include "brpc/builtin/prometheus_metrics_service.h"
 #include "brpc/builtin/common.h"
 #include "bvar/bvar.h"
+#include "prometheus/text_serializer.h"
+#include "prometheus/collectable.h"
 
 namespace bvar {
 DECLARE_int32(bvar_latency_p1);
@@ -32,10 +32,9 @@ DECLARE_int32(bvar_latency_p2);
 DECLARE_int32(bvar_latency_p3);
 }
 
-namespace brpc {
+using prometheus::Collectable;
 
-// Defined in server.cpp
-extern const char* const g_server_info_prefix;
+namespace brpc {
 
 // This is a class that convert bvar result to prometheus output.
 // Currently the output only includes gauge and summary for two
@@ -66,8 +65,8 @@ private:
 
     struct SummaryItems {
         std::string latency_percentiles[NPERCENTILES];
-        int64_t latency_avg;
-        int64_t count;
+        std::string latency_avg;
+        std::string count;
         std::string metric_name;
 
         bool IsComplete() const { return !metric_name.empty(); }
@@ -108,7 +107,6 @@ PrometheusMetricsDumper::ProcessLatencyRecorderSuffix(const butil::StringPiece& 
         "_latency_999", "_latency_9999", "_max_latency"
     };
     CHECK(NPERCENTILES == arraysize(latency_names));
-    const std::string desc_str = desc.as_string();
     butil::StringPiece metric_name(name);
     for (int i = 0; i < NPERCENTILES; ++i) {
         if (!metric_name.ends_with(latency_names[i])) {
@@ -116,7 +114,7 @@ PrometheusMetricsDumper::ProcessLatencyRecorderSuffix(const butil::StringPiece& 
         }
         metric_name.remove_suffix(latency_names[i].size());
         SummaryItems* si = &_m[metric_name.as_string()];
-        si->latency_percentiles[i] = desc_str;
+        si->latency_percentiles[i] = desc.as_string();
         if (i == NPERCENTILES - 1) {
             // '_max_latency' is the last suffix name that appear in the sorted bvar
             // list, which means all related percentiles have been gathered and we are
@@ -129,13 +127,13 @@ PrometheusMetricsDumper::ProcessLatencyRecorderSuffix(const butil::StringPiece& 
     if (metric_name.ends_with("_latency")) {
         metric_name.remove_suffix(8);
         SummaryItems* si = &_m[metric_name.as_string()];
-        si->latency_avg = strtoll(desc_str.data(), NULL, 10);
+        si->latency_avg = desc.as_string();
         return si;
     }
     if (metric_name.ends_with("_count")) {
         metric_name.remove_suffix(6);
         SummaryItems* si = &_m[metric_name.as_string()];
-        si->count = strtoll(desc_str.data(), NULL, 10);
+        si->count = desc.as_string();
         return si;
     }
     return NULL;
@@ -174,7 +172,8 @@ bool PrometheusMetricsDumper::DumpLatencyRecorderSuffix(
          << si->metric_name << "_sum "
          // There is no sum of latency in bvar output, just use
          // average * count as approximation
-         << si->latency_avg * si->count << '\n'
+         << strtoll(si->latency_avg.data(), NULL, 10) *
+                strtoll(si->count.data(), NULL, 10) << '\n'
          << si->metric_name << "_count " << si->count << '\n';
     return true;
 }
@@ -186,21 +185,48 @@ void PrometheusMetricsService::default_method(::google::protobuf::RpcController*
     ClosureGuard done_guard(done);
     Controller *cntl = static_cast<Controller*>(cntl_base);
     cntl->http_response().set_content_type("text/plain");
-    if (DumpPrometheusMetricsToIOBuf(&cntl->response_attachment()) != 0) {
+    butil::IOBufBuilder os;
+    PrometheusMetricsDumper dumper(&os, _server->ServerPrefix());
+    const int ndump = bvar::Variable::dump_exposed(&dumper, NULL);
+    if (ndump < 0) {
         cntl->SetFailed("Fail to dump metrics");
         return;
     }
+    DumpCollectable(&os);
+    os.move_to(cntl->response_attachment());
 }
 
-int DumpPrometheusMetricsToIOBuf(butil::IOBuf* output) {
-    butil::IOBufBuilder os;
-    PrometheusMetricsDumper dumper(&os, g_server_info_prefix);
-    const int ndump = bvar::Variable::dump_exposed(&dumper, NULL);
-    if (ndump < 0) {
-        return -1;
+void PrometheusMetricsService::RegisterCollectable(const std::weak_ptr<Collectable>& collectable) {
+    CHECK(!collectable.expired()) << "collectable is expired";
+    collectables_.push_back(collectable);
+}
+
+bool PrometheusMetricsService::DumpCollectable(butil::IOBufBuilder* os) {
+    auto metrics = CollectMetrics();
+    
+    auto serializer = std::unique_ptr<prometheus::Serializer>{new prometheus::TextSerializer()};
+
+    *os << serializer->Serialize(metrics);
+
+    return true;
+}
+
+std::vector<prometheus::MetricFamily> PrometheusMetricsService::CollectMetrics() const {
+    auto collected_metrics = std::vector<prometheus::MetricFamily>{};
+
+    for (auto&& wcollectable : collectables_) {
+        auto collectable = wcollectable.lock();
+        if (!collectable) {
+          continue;
+        }
+
+        auto&& metrics = collectable->Collect();
+        collected_metrics.insert(collected_metrics.end(),
+                            std::make_move_iterator(metrics.begin()),
+                            std::make_move_iterator(metrics.end()));
     }
-    os.move_to(*output);
-    return 0;
+
+    return collected_metrics;
 }
 
 } // namespace brpc

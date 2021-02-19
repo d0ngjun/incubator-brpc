@@ -1,20 +1,19 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Copyright (c) 2014 Baidu, Inc.
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
+//          Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
@@ -60,7 +59,8 @@ DEFINE_bool(baidu_protocol_use_fullname, true,
 
 // Pack header into `buf'
 inline void PackRpcHeader(char* rpc_header, int meta_size, int payload_size) {
-    uint32_t* dummy = (uint32_t*)rpc_header;  // suppress strict-alias warning
+    // supress strict-aliasing warning.
+    uint32_t* dummy = (uint32_t*)rpc_header;
     *dummy = *(uint32_t*)"PRPC";
     butil::RawPacker(rpc_header + 4)
         .pack32(meta_size + payload_size)
@@ -140,11 +140,14 @@ void SendRpcResponse(int64_t correlation_id,
                      const Server* server,
                      MethodStatus* method_status,
                      int64_t received_us) {
+    BossHostGuard boss_host_guard(cntl);
+
     ControllerPrivateAccessor accessor(cntl);
     Span* span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
+    cntl->set_end_rpc_time_us(butil::gettimeofday_us());
     Socket* sock = accessor.get_sending_socket();
     std::unique_ptr<Controller, LogErrorTextAndDelete> recycle_cntl(cntl);
     ConcurrencyRemover concurrency_remover(method_status, cntl, received_us);
@@ -318,12 +321,12 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
 
     SampledRequest* sample = AskToBeSampled();
     if (sample) {
-        sample->meta.set_service_name(request_meta.service_name());
-        sample->meta.set_method_name(request_meta.method_name());
-        sample->meta.set_compress_type((CompressType)meta.compress_type());
-        sample->meta.set_protocol_type(PROTOCOL_BAIDU_STD);
-        sample->meta.set_attachment_size(meta.attachment_size());
-        sample->meta.set_authentication_data(meta.authentication_data());
+        sample->set_service_name(request_meta.service_name());
+        sample->set_method_name(request_meta.method_name());
+        sample->set_compress_type((CompressType)meta.compress_type());
+        sample->set_protocol_type(PROTOCOL_BAIDU_STD);
+        sample->set_attachment_size(meta.attachment_size());
+        sample->set_authentication_data(meta.authentication_data());
         sample->request = msg->payload;
         sample->submit(start_parse_us);
     }
@@ -333,6 +336,7 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         LOG(WARNING) << "Fail to new Controller";
         return;
     }
+    cntl->set_begin_rpc_time_us(butil::gettimeofday_us());
     std::unique_ptr<google::protobuf::Message> req;
     std::unique_ptr<google::protobuf::Message> res;
 
@@ -637,11 +641,11 @@ void PackRpcRequest(butil::IOBuf* req_buf,
                                        method->service()->name());
         request_meta->set_method_name(method->name());
         meta.set_compress_type(cntl->request_compress_type());
-    } else if (cntl->sampled_request()) {
+    } else if (cntl->rpc_dump_meta()) {
         // Replaying. Keep service-name as the one seen by server.
-        request_meta->set_service_name(cntl->sampled_request()->meta.service_name());
-        request_meta->set_method_name(cntl->sampled_request()->meta.method_name());
-        meta.set_compress_type(cntl->sampled_request()->meta.compress_type());
+        request_meta->set_service_name(cntl->rpc_dump_meta()->service_name());
+        request_meta->set_method_name(cntl->rpc_dump_meta()->method_name());
+        meta.set_compress_type(cntl->rpc_dump_meta()->compress_type());
     } else {
         return cntl->SetFailed(ENOMETHOD, "%s.method is NULL", __FUNCTION__);
     }

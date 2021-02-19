@@ -1,20 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright (c) 2014 Baidu, Inc.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef USE_MESALINK
 #include <openssl/ssl.h>
@@ -38,6 +36,9 @@
 #include "brpc/policy/remote_file_naming_service.h"
 #include "brpc/policy/consul_naming_service.h"
 #include "brpc/policy/discovery_naming_service.h"
+#include "brpc/policy/ons_naming_service.h"
+#include "brpc/policy/ons_stateful_naming_service.h"
+#include "brpc/policy/polaris_naming_service.h"
 
 // Load Balancers
 #include "brpc/policy/round_robin_load_balancer.h"
@@ -70,6 +71,8 @@
 #include "brpc/policy/nshead_mcpack_protocol.h"
 #include "brpc/policy/rtmp_protocol.h"
 #include "brpc/policy/esp_protocol.h"
+#include "brpc/policy/trpc_protocol.h"
+#include "brpc/policy/wup_protocol.h"
 #ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
 # include "brpc/policy/thrift_protocol.h"
 #endif
@@ -120,7 +123,7 @@ struct GlobalExtensions {
         , ch_ketama_lb(CONS_HASH_LB_KETAMA)
         , constant_cl(0) {
     }
-    
+
 #ifdef BAIDU_INTERNAL
     BaiduNamingService bns;
 #endif
@@ -130,6 +133,9 @@ struct GlobalExtensions {
     RemoteFileNamingService rfns;
     ConsulNamingService cns;
     DiscoveryNamingService dcns;
+    OnsNamingService ons;
+    OnsStatefulNamingService onss;
+    PolarisNamingService pns;
 
     RoundRobinLoadBalancer rr_lb;
     WeightedRoundRobinLoadBalancer wrr_lb;
@@ -351,6 +357,11 @@ static void GlobalInitializeOrDieImpl() {
     NamingServiceExtension()->RegisterOrDie("remotefile", &g_ext->rfns);
     NamingServiceExtension()->RegisterOrDie("consul", &g_ext->cns);
     NamingServiceExtension()->RegisterOrDie("discovery", &g_ext->dcns);
+    NamingServiceExtension()->RegisterOrDie("ons", &g_ext->ons);
+    NamingServiceExtension()->RegisterOrDie("onss", &g_ext->onss);
+    NamingServiceExtension()->RegisterOrDie("pons", &g_ext->pns);
+    NamingServiceExtension()->RegisterOrDie("polaris", &g_ext->pns);
+    NamingServiceExtension()->RegisterOrDie("cl5", &g_ext->pns);
 
     // Load Balancers
     LoadBalancerExtension()->RegisterOrDie("rr", &g_ext->rr_lb);
@@ -488,7 +499,7 @@ static void GlobalInitializeOrDieImpl() {
     Protocol redis_protocol = { ParseRedisMessage,
                                 SerializeRedisRequest,
                                 PackRedisRequest,
-                                ProcessRedisRequest, ProcessRedisResponse,
+                                NULL, ProcessRedisResponse,
                                 NULL, NULL, GetRedisMethodName,
                                 CONNECTION_TYPE_ALL, "redis" };
     if (RegisterProtocol(PROTOCOL_REDIS, redis_protocol) != 0) {
@@ -568,6 +579,37 @@ static void GlobalInitializeOrDieImpl() {
     if (RegisterProtocol(PROTOCOL_ESP, esp_protocol) != 0) {
         exit(1);
     }
+/*
+    Protocol baidu_protocol = { ParseRpcMessage,
+                                SerializeRequestDefault, PackRpcRequest,
+                                ProcessRpcRequest, ProcessRpcResponse,
+                                VerifyRpcRequest, NULL, NULL,
+                                CONNECTION_TYPE_ALL, "baidu_std" };
+    if (RegisterProtocol(PROTOCOL_BAIDU_STD, baidu_protocol) != 0) {
+        exit(1);
+    }
+*/
+    // Only valid at client side
+    Protocol trpc_protocol = { 
+        ParseTrpcMessage,
+        SerializeRequestDefault, PackTrpcRequest,
+        ProcessTrpcRequest, ProcessTrpcResponse,
+        NULL, NULL, NULL,
+        CONNECTION_TYPE_SHORT, "trpc" }; //TODO consider CONNECTION_TYPE_POOLED_AND_SHORT
+    if (RegisterProtocol(PROTOCOL_TRPC, trpc_protocol) != 0) {
+        exit(1);
+    }
+
+    // Only valid at client side
+    Protocol wup_protocol = { 
+        ParseWupMessage,
+        SerializeWupRequest, PackWupRequest,
+        NULL, ProcessWupResponse,
+        NULL, NULL, NULL,
+        CONNECTION_TYPE_POOLED_AND_SHORT, "wup" }; 
+    if (RegisterProtocol(PROTOCOL_WUP, wup_protocol) != 0) {
+        exit(1);
+    }
 
     std::vector<Protocol> protocols;
     ListProtocols(&protocols);
@@ -590,7 +632,7 @@ static void GlobalInitializeOrDieImpl() {
     // Concurrency Limiters
     ConcurrencyLimiterExtension()->RegisterOrDie("auto", &g_ext->auto_cl);
     ConcurrencyLimiterExtension()->RegisterOrDie("constant", &g_ext->constant_cl);
-    
+
     if (FLAGS_usercode_in_pthread) {
         // Optional. If channel/server are initialized before main(), this
         // flag may be false at here even if it will be set to true after

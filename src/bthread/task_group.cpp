@@ -1,22 +1,19 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-
 // bthread - A M:N threading library to make applications more concurrent.
+// Copyright (c) 2012 Baidu, Inc.
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+// Author: Ge,Jun (gejun@baidu.com)
 // Date: Tue Jul 10 17:40:58 CST 2012
 
 #include <sys/types.h>
@@ -28,6 +25,7 @@
 #include "butil/fast_rand.h"
 #include "butil/unique_ptr.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h" // fmix64
+#include "butil/color_log_header.h"
 #include "bthread/errno.h"                  // ESTOP
 #include "bthread/butex.h"                  // butex_*
 #include "bthread/sys_futex.h"              // futex_wake_private
@@ -236,6 +234,7 @@ int TaskGroup::init(size_t runqueue_capacity) {
     m->fn = NULL;
     m->arg = NULL;
     m->local_storage = LOCAL_STORAGE_INIT;
+    m->local_storage.color_log_header = logging::GetColorLogHeader();
     m->cpuwide_start_ns = butil::cpuwide_time_ns();
     m->stat = EMPTY_STAT;
     m->attr = BTHREAD_ATTR_TASKGROUP;
@@ -322,7 +321,14 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
             tls_bls.keytable = NULL;
             m->local_storage.keytable = NULL; // optional
         }
-        
+
+        if (tls_bls.color_log_header) {
+            logging::ColorLogHeader* p = 
+                reinterpret_cast<logging::ColorLogHeader*>(tls_bls.color_log_header);
+            butil::return_resource(p->id());
+            tls_bls.color_log_header = nullptr;
+            m->local_storage.color_log_header = nullptr;
+        }
         // Increase the version and wake up all joiners, if resulting version
         // is 0, change it to 1 to make bthread_t never be 0. Any access
         // or join to the bthread after changing version will be rejected.
@@ -380,6 +386,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     CHECK(m->stack == NULL);
     m->attr = using_attr;
     m->local_storage = LOCAL_STORAGE_INIT;
+    m->local_storage.color_log_header = logging::GetColorLogHeader();
     m->cpuwide_start_ns = start_ns;
     m->stat = EMPTY_STAT;
     m->tid = make_tid(*m->version_butex, slot);
@@ -435,6 +442,7 @@ int TaskGroup::start_background(bthread_t* __restrict th,
     CHECK(m->stack == NULL);
     m->attr = using_attr;
     m->local_storage = LOCAL_STORAGE_INIT;
+    m->local_storage.color_log_header = logging::GetColorLogHeader();
     m->cpuwide_start_ns = start_ns;
     m->stat = EMPTY_STAT;
     m->tid = make_tid(*m->version_butex, slot);
